@@ -1,0 +1,11 @@
+.git
+.github
+.gitignore
+.dockerignore
+*.md
+.vscode
+.idea
+tmp/
+.env
+src/Qwen3_TTS_Colab_BUG.ipynb
+AGENTS.md

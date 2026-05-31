@@ -1,0 +1,10 @@
+# Gradio UI + Qwen3-TTS (pinned loosely; Docker build uses pip -U where needed)
+qwen-tts>=0.0.5
+gradio>=5.0,<6
+numpy>=1.26
+scipy>=1.11
+huggingface_hub>=0.23
+openai-whisper>=20231117
+librosa>=0.10
+tqdm>=4.66
+soundfile>=0.12
