@@ -19,6 +19,7 @@ LABEL org.opencontainers.image.source="https://github.com/akai2211/Qwen3-TTS-Vas
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONUNBUFFERED=1 \
     APP_DIR=/app \
     WORKSPACE=/workspace \
@@ -46,17 +47,17 @@ RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d \
 
 WORKDIR ${APP_DIR}
 
-# PyTorch cu128 — prebuilt wheels, sm_120 (RTX 5090 / 50xx)
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir torch torchvision torchaudio \
+# PyTorch cu128 — prebuilt wheels, sm_120 (RTX 5090 / 50xx).
+# Не апгрейдим pip: в base-image он из debian, uninstall падает в CI.
+RUN python3 -m pip install --no-cache-dir torch torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128
 
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
 # flash-attn: только готовый wheel (без компиляции в CI)
-RUN pip install --no-cache-dir --only-binary :all: flash-attn \
+RUN python3 -m pip install --no-cache-dir --only-binary :all: flash-attn \
     || echo "INFO: flash-attn wheel not found — app falls back to sdpa/eager"
 
 COPY src/app/ ${APP_DIR}/
@@ -74,4 +75,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
     CMD curl -sf -o /dev/null "http://127.0.0.1:${GRADIO_SERVER_PORT}/" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["python", "/app/app.py"]
+CMD ["python3", "/app/app.py"]
