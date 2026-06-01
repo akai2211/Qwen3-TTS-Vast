@@ -150,7 +150,7 @@ cu121 на 50xx: синтез падает `no kernel image is available`.
 - [ ] Подтвердить на **RTX 4090** (Ada) и **5090** (отдельные инстансы)
 - [ ] Отдельный тег образа `:cu121` для дешёвых 30xx/40xx (опционально)
 - [ ] OpenAI-compatible API (`/v1/audio/speech`) — свой слой или образ malaiwah
-- [ ] Auto-download моделей при старте (`provision_models.sh`, env с ID модели)
+- [x] Auto-download моделей при старте (`QWEN_PROVISION_MODELS=1`, фоновый поток в `app.py`)
 - [ ] Публичный шаблон Vast в каталоге (сейчас private — ок)
 - [ ] Сжатие/квантование моделей для 8 GB GPU (0.6B по умолчанию в UI)
 
