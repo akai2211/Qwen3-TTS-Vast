@@ -18,7 +18,6 @@ import torch
 import json
 import shutil
 import tempfile
-import threading
 import zipfile
 import scipy.io.wavfile as wavfile
 from datetime import datetime, timezone
@@ -536,16 +535,6 @@ def transcribe_audio(audio):
 # Global model holders - keyed by (model_type, model_size)
 loaded_models = {}
 
-_provision_lock = threading.Lock()
-_provision_state = {
-    "running": False,
-    "done": False,
-    "current": None,
-    "completed": 0,
-    "total": 0,
-    "errors": [],
-}
-
 # Model size options
 MODEL_SIZES = ["0.6B", "1.7B"]
 
@@ -576,113 +565,6 @@ def get_model_path(model_type: str, model_size: str) -> str:
     return snapshot_download(get_model_repo_id(model_type, model_size))
 
 
-def iter_all_models():
-    """All (model_type, model_size) pairs from AVAILABLE_MODELS."""
-    for model_type, info in AVAILABLE_MODELS.items():
-        for size in info["sizes"]:
-            yield model_type, size
-
-
-def _provision_models_enabled() -> bool:
-    flag = os.environ.get("QWEN_PROVISION_MODELS", "1").strip().lower()
-    return flag not in ("0", "false", "no", "off")
-
-
-def get_provision_status_line() -> str:
-    """One-line banner for UI while background provisioning runs."""
-    with _provision_lock:
-        if _provision_state["done"] and not _provision_state["running"]:
-            if _provision_state["errors"]:
-                return (
-                    f"⚠️ Предзагрузка завершена с ошибками ({len(_provision_state['errors'])}). "
-                    "См. LOG контейнера."
-                )
-            return "✅ Все модели скачаны на диск (кэш Hugging Face)."
-        if _provision_state["running"]:
-            current = _provision_state["current"] or "…"
-            done = _provision_state["completed"]
-            total = _provision_state["total"]
-            return f"🔄 Предзагрузка на диск: **{current}** ({done}/{total}) — UI уже доступен."
-    if _provision_models_enabled():
-        return "⏳ Предзагрузка моделей скоро начнётся…"
-    return ""
-
-
-def provision_all_models() -> None:
-    """Download every AVAILABLE_MODELS repo into HF cache (disk only, not VRAM)."""
-    global _provision_state
-    models = list(iter_all_models())
-
-    with _provision_lock:
-        if _provision_state["running"]:
-            return
-        _provision_state.update(
-            {
-                "running": True,
-                "done": False,
-                "current": None,
-                "completed": 0,
-                "total": len(models),
-                "errors": [],
-            }
-        )
-
-    print(f"[provision] Starting download of {len(models)} model(s) → {os.environ.get('HF_HOME')}")
-
-    try:
-        for idx, (model_type, model_size) in enumerate(models, start=1):
-            repo_id = get_model_repo_id(model_type, model_size)
-            with _provision_lock:
-                _provision_state["current"] = f"{model_type} {model_size}"
-
-            if check_model_downloaded(model_type, model_size):
-                print(f"[provision] ({idx}/{len(models)}) Skip (cached): {repo_id}")
-            else:
-                print(f"[provision] ({idx}/{len(models)}) Downloading: {repo_id}")
-                snapshot_download(repo_id)
-                print(f"[provision] ({idx}/{len(models)}) Done: {repo_id}")
-
-            with _provision_lock:
-                _provision_state["completed"] = idx
-
-        print("[provision] All models are on disk.")
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-        print(f"[provision] ERROR: {err}")
-        with _provision_lock:
-            _provision_state["errors"].append(err)
-    finally:
-        with _provision_lock:
-            _provision_state["running"] = False
-            _provision_state["done"] = True
-            _provision_state["current"] = None
-
-
-def start_model_provisioning() -> None:
-    """Start background provisioning thread (enabled by default on Vast)."""
-    if not _provision_models_enabled():
-        print("[provision] QWEN_PROVISION_MODELS=0 — automatic download disabled")
-        with _provision_lock:
-            _provision_state["done"] = True
-        return
-
-    models = list(iter_all_models())
-    if all(check_model_downloaded(mt, ms) for mt, ms in models):
-        print("[provision] All models already in HF cache.")
-        with _provision_lock:
-            _provision_state["done"] = True
-            _provision_state["total"] = len(models)
-            _provision_state["completed"] = len(models)
-        return
-
-    thread = threading.Thread(
-        target=provision_all_models,
-        name="qwen-model-provision",
-        daemon=True,
-    )
-    thread.start()
-
-
 def check_model_downloaded(model_type: str, model_size: str) -> bool:
     """Check if a model is already downloaded in the cache."""
     try:
@@ -698,12 +580,7 @@ def check_model_downloaded(model_type: str, model_size: str) -> bool:
 
 def get_downloaded_models_status() -> str:
     """Get status of all available models."""
-    lines = []
-    banner = get_provision_status_line()
-    if banner:
-        lines.append(banner)
-        lines.append("")
-    lines.append("### Статус загрузки моделей\n")
+    lines = ["### Статус загрузки моделей\n"]
     for model_type, info in AVAILABLE_MODELS.items():
         lines.append(f"**{model_type}** - {info['description']}")
         for size in info["sizes"]:
@@ -1733,9 +1610,8 @@ def build_ui():
             with gr.Tab("⚙️ Модели"):
                 with gr.Accordion("📥 Загрузка моделей", open=True):
                     gr.Markdown(
-                        "*💡 При старте инстанса все модели **автоматически скачиваются на диск** "
-                        "(кэш `/workspace/cache/huggingface`). Это занимает SSD, не VRAM. "
-                        "Отключить: `QWEN_PROVISION_MODELS=0`. Ручная кнопка «Скачать» — по одной модели.*"
+                        "*💡 Модели скачиваются на диск в `/workspace/cache/huggingface` "
+                        "(SSD, не VRAM) — кнопкой «Скачать» или при первой генерации.*"
                     )
                     with gr.Row():
                         with gr.Column(scale=1):
@@ -2468,7 +2344,6 @@ if __name__ == "__main__":
     server_name = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
     server_port = int(os.environ.get("GRADIO_SERVER_PORT", os.environ.get("QWEN_TTS_PORT", "8000")))
 
-    start_model_provisioning()
     demo = build_ui()
     demo.launch(
         server_name=server_name,
