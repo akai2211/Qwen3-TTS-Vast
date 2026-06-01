@@ -17,7 +17,10 @@ import numpy as np
 import torch
 import json
 import shutil
+import tempfile
+import zipfile
 import scipy.io.wavfile as wavfile
+from datetime import datetime, timezone
 from pathlib import Path
 from huggingface_hub import snapshot_download, scan_cache_dir
 from database import VOICE_DATABASE
@@ -48,6 +51,243 @@ DESIGNED_VOICES_DIR.mkdir(parents=True, exist_ok=True)
 if not DESIGNED_VOICES_JSON.exists():
     with open(DESIGNED_VOICES_JSON, "w", encoding="utf-8") as f:
         json.dump({}, f, ensure_ascii=False, indent=2)
+
+VOICES_ARCHIVE_FORMAT_VERSION = 1
+VOICES_ARCHIVE_MAX_BYTES = 200 * 1024 * 1024
+EXPORTS_DIR = WORKSPACE / "exports"
+EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _read_voices_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def _uploaded_file_path(upload) -> Path | None:
+    if upload is None:
+        return None
+    if isinstance(upload, str):
+        return Path(upload) if upload else None
+    if isinstance(upload, dict):
+        p = upload.get("path") or upload.get("name")
+        return Path(p) if p else None
+    p = getattr(upload, "name", None) or str(upload)
+    return Path(p) if p else None
+
+
+def get_voices_backup_summary() -> str:
+    clone_n = len(get_saved_voices())
+    design_n = len(get_saved_designed_voices())
+    return (
+        f"Сохранено на инстансе: **{clone_n}** клон(ов), **{design_n}** дизайн(ов). "
+        "Архив включает `/workspace/custom_voices` и `/workspace/designed_voices`."
+    )
+
+
+def export_all_user_voices():
+    """Pack clone + design voices into a zip for download."""
+    clone_voices = _read_voices_json(VOICES_JSON)
+    design_voices = _read_voices_json(DESIGNED_VOICES_JSON)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    archive_path = EXPORTS_DIR / f"qwen3-tts-voices-{timestamp}.zip"
+
+    manifest = {
+        "format_version": VOICES_ARCHIVE_FORMAT_VERSION,
+        "app": "qwen3-tts-vast",
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "clone_count": len(clone_voices),
+        "design_count": len(design_voices),
+    }
+
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
+        zf.writestr(
+            "custom_voices/voices.json",
+            json.dumps(clone_voices, ensure_ascii=False, indent=2),
+        )
+        for name in clone_voices:
+            wav_path = VOICES_DIR / f"{name}.wav"
+            if wav_path.is_file():
+                zf.write(wav_path, f"custom_voices/{wav_path.name}")
+            else:
+                ref = clone_voices[name].get("ref_audio_path", "")
+                ref_path = Path(ref) if ref else None
+                if ref_path and ref_path.is_file():
+                    zf.write(ref_path, f"custom_voices/{ref_path.name}")
+        for wav_path in sorted(VOICES_DIR.glob("*.wav")):
+            arcname = f"custom_voices/{wav_path.name}"
+            if arcname not in zf.namelist():
+                zf.write(wav_path, arcname)
+
+        zf.writestr(
+            "designed_voices/voices.json",
+            json.dumps(design_voices, ensure_ascii=False, indent=2),
+        )
+
+    return str(archive_path)
+
+
+def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
+    dest = dest.resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    total = sum(info.file_size for info in zf.infolist())
+    if total > VOICES_ARCHIVE_MAX_BYTES:
+        raise ValueError(
+            f"Архив слишком большой ({total // (1024 * 1024)} MB, лимит "
+            f"{VOICES_ARCHIVE_MAX_BYTES // (1024 * 1024)} MB)."
+        )
+
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        name = info.filename.replace("\\", "/")
+        if name.startswith("__MACOSX/") or "/../" in f"/{name}/":
+            continue
+        target = (dest / name).resolve()
+        if dest not in target.parents and target != dest:
+            raise ValueError(f"Небезопасный путь в архиве: {info.filename}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+
+def import_all_user_voices(archive_file):
+    """Import clone + design voices from a zip produced by export_all_user_voices."""
+    path = _uploaded_file_path(archive_file)
+    if path is None or not path.is_file():
+        return (
+            "❌ Выберите файл архива (.zip).",
+            gr.update(),
+            gr.update(),
+            get_voices_backup_summary(),
+        )
+
+    if path.suffix.lower() != ".zip":
+        return (
+            "❌ Нужен ZIP-архив (расширение .zip).",
+            gr.update(),
+            gr.update(),
+            get_voices_backup_summary(),
+        )
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="q3voice-import-", dir=str(EXPORTS_DIR)))
+    try:
+        with zipfile.ZipFile(path) as zf:
+            _safe_extract_zip(zf, temp_dir)
+
+        clone_src = temp_dir / "custom_voices"
+        design_src = temp_dir / "designed_voices"
+        if not clone_src.is_dir() and (temp_dir / "voices.json").is_file():
+            clone_src = temp_dir
+
+        imported_clone = _read_voices_json(clone_src / "voices.json")
+        imported_design = _read_voices_json(design_src / "voices.json")
+
+        if not imported_clone and not imported_design:
+            return (
+                "❌ В архиве нет custom_voices/voices.json и designed_voices/voices.json.",
+                gr.update(),
+                gr.update(),
+                get_voices_backup_summary(),
+            )
+
+        if clone_src.is_dir():
+            for wav_path in clone_src.glob("*.wav"):
+                shutil.copy2(wav_path, VOICES_DIR / wav_path.name)
+
+        current_clone = _read_voices_json(VOICES_JSON)
+        added_clone, overwritten_clone, skipped_clone = [], [], []
+
+        for name, meta in imported_clone.items():
+            if not isinstance(meta, dict):
+                skipped_clone.append(name)
+                continue
+            local_wav = VOICES_DIR / f"{name}.wav"
+            if not local_wav.is_file():
+                ref = meta.get("ref_audio_path", "")
+                basename = os.path.basename(ref) if ref else ""
+                candidates = [
+                    clone_src / f"{name}.wav",
+                    clone_src / basename,
+                ]
+                for candidate in candidates:
+                    if candidate.is_file():
+                        shutil.copy2(candidate, local_wav)
+                        break
+            if not local_wav.is_file():
+                skipped_clone.append(name)
+                continue
+
+            meta = dict(meta)
+            meta["ref_audio_path"] = str(local_wav)
+            if name in current_clone:
+                overwritten_clone.append(name)
+            else:
+                added_clone.append(name)
+            current_clone[name] = meta
+
+        with open(VOICES_JSON, "w", encoding="utf-8") as f:
+            json.dump(current_clone, f, ensure_ascii=False, indent=2)
+
+        current_design = _read_voices_json(DESIGNED_VOICES_JSON)
+        added_design, overwritten_design = [], []
+
+        for name, meta in imported_design.items():
+            if not isinstance(meta, dict):
+                continue
+            if name in current_design:
+                overwritten_design.append(name)
+            else:
+                added_design.append(name)
+            current_design[name] = meta
+
+        with open(DESIGNED_VOICES_JSON, "w", encoding="utf-8") as f:
+            json.dump(current_design, f, ensure_ascii=False, indent=2)
+
+        lines = ["✅ Импорт завершён."]
+        if added_clone or overwritten_clone:
+            lines.append(
+                f"Клоны: добавлено {len(added_clone)}, обновлено {len(overwritten_clone)}."
+            )
+        if added_design or overwritten_design:
+            lines.append(
+                f"Дизайны: добавлено {len(added_design)}, обновлено {len(overwritten_design)}."
+            )
+        if skipped_clone:
+            lines.append(
+                f"⚠️ Пропущены клоны без эталонного wav: {', '.join(skipped_clone[:10])}"
+                + ("…" if len(skipped_clone) > 10 else "")
+            )
+
+        return (
+            "\n".join(lines),
+            gr.update(choices=get_saved_voices()),
+            gr.update(choices=get_saved_designed_voices()),
+            get_voices_backup_summary(),
+        )
+    except zipfile.BadZipFile:
+        return (
+            "❌ Файл повреждён или это не ZIP.",
+            gr.update(),
+            gr.update(),
+            get_voices_backup_summary(),
+        )
+    except Exception as e:
+        return (
+            f"❌ Ошибка импорта: {e}",
+            gr.update(),
+            gr.update(),
+            get_voices_backup_summary(),
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 def get_saved_voices():
     """Get list of saved voices."""
@@ -1458,6 +1698,52 @@ def build_ui():
                     outputs=[design_instruct, apply_status]
                 )
 
+            # Tab 5: Backup / restore user voices (clone + design)
+            with gr.Tab("💾 Бэкап голосов"):
+                backup_summary = gr.Markdown(value=get_voices_backup_summary())
+                gr.Markdown(
+                    "Скачайте **все** сохранённые клоны и дизайны одним ZIP-архивом "
+                    "или загрузите архив на другой инстанс. "
+                    "Пресеты из «Свои голоса» (Ryan и др.) в архив не входят."
+                )
+                with gr.Row():
+                    export_voices_btn = gr.DownloadButton(
+                        "📥 Скачать все голоса (ZIP)",
+                        variant="primary",
+                    )
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        backup_upload = gr.File(
+                            label="Архив для загрузки",
+                            file_types=[".zip"],
+                            type="filepath",
+                        )
+                    with gr.Column(scale=1):
+                        import_voices_btn = gr.Button(
+                            "📤 Загрузить архив",
+                            variant="secondary",
+                        )
+                backup_status = gr.Textbox(
+                    label="Статус",
+                    lines=4,
+                    interactive=False,
+                )
+
+                export_voices_btn.click(
+                    export_all_user_voices,
+                    inputs=[],
+                    outputs=export_voices_btn,
+                )
+                import_voices_btn.click(
+                    import_all_user_voices,
+                    inputs=[backup_upload],
+                    outputs=[
+                        backup_status,
+                        saved_voices_dropdown,
+                        saved_designs_dropdown,
+                        backup_summary,
+                    ],
+                )
 
         gr.HTML(
             """
@@ -1470,9 +1756,13 @@ def build_ui():
 
         # Refresh dropdowns on page load
         demo.load(
-            lambda: [gr.update(choices=get_saved_voices()), gr.update(choices=get_saved_designed_voices())],
+            lambda: [
+                gr.update(choices=get_saved_voices()),
+                gr.update(choices=get_saved_designed_voices()),
+                get_voices_backup_summary(),
+            ],
             inputs=None,
-            outputs=[saved_voices_dropdown, saved_designs_dropdown]
+            outputs=[saved_voices_dropdown, saved_designs_dropdown, backup_summary],
         )
 
     return demo
@@ -1493,5 +1783,6 @@ if __name__ == "__main__":
         allowed_paths=[
             str(VOICES_DIR.absolute()),
             str(DESIGNED_VOICES_DIR.absolute()),
+            str(EXPORTS_DIR.absolute()),
         ],
     )
