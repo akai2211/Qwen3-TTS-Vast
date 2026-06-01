@@ -80,11 +80,12 @@ persist_portal_env() {
     touch /etc/environment
     for var in ENABLE_HTTPS PORTAL_CONFIG AUTH_EXCLUDE OPEN_BUTTON_PORT; do
         if [[ -n "${!var:-}" ]]; then
-            if grep -q "^${var}=" /etc/environment 2>/dev/null; then
-                sed -i "s|^${var}=.*|${var}='${!var}'|" /etc/environment
-            else
-                echo "${var}='${!var}'" >> /etc/environment
-            fi
+            # PORTAL_CONFIG содержит '|' — sed с разделителем | ломается
+            local tmp
+            tmp="$(mktemp)"
+            grep -v "^${var}=" /etc/environment >"$tmp" 2>/dev/null || true
+            mv "$tmp" /etc/environment
+            printf "%s='%s'\n" "$var" "${!var}" >> /etc/environment
         fi
     done
     if [[ -x /opt/instance-tools/bin/export_env.sh ]]; then

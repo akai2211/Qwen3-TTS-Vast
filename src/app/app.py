@@ -931,7 +931,7 @@ def build_ui():
     }
     """
 
-    with gr.Blocks(title="Qwen3-TTS Demo") as demo:
+    with gr.Blocks(title="Qwen3-TTS Demo", theme=theme, css=css) as demo:
         gr.HTML(
             """
             <div class="header-container">
@@ -1475,7 +1475,7 @@ def build_ui():
             outputs=[saved_voices_dropdown, saved_designs_dropdown]
         )
 
-    return demo, theme, css
+    return demo
 
 
 if __name__ == "__main__":
@@ -1486,12 +1486,10 @@ if __name__ == "__main__":
     server_name = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
     server_port = int(os.environ.get("GRADIO_SERVER_PORT", os.environ.get("QWEN_TTS_PORT", "8000")))
 
-    demo, theme, css = build_ui()
+    demo = build_ui()
     demo.launch(
         server_name=server_name,
         server_port=server_port,
-        theme=theme,
-        css=css,
         allowed_paths=[
             str(VOICES_DIR.absolute()),
             str(DESIGNED_VOICES_DIR.absolute()),
