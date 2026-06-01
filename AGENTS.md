@@ -56,9 +56,37 @@ vastai/base-image:cuda-12.9-mini-py312-2026-04-15
 
 | Путь | Назначение |
 |---|---|
-| `cache/huggingface` | `HF_HOME`, веса |
-| `custom_voices`, `designed_voices` | сохранённые голоса |
-| `outputs`, `log` | зарезервировано |
+| `cache/huggingface` | `HF_HOME`, веса моделей (диск) |
+| `custom_voices`, `designed_voices` | сохранённые голоса (клон / дизайн) |
+| `exports` | ZIP бэкапы и временные файлы импорта |
+| `outputs` | служебное (Gradio / экспорт) |
+| `log` | зарезервировано |
+
+### Предзагрузка моделей на диск (при старте)
+
+При `python3 /app/app.py` вызывается `start_model_provisioning()` — **фоновый поток**, не блокирует UI.
+
+| | |
+|---|---|
+| **Что качает** | 5 репозиториев: VoiceDesign 1.7B; Base 0.6B/1.7B; CustomVoice 0.6B/1.7B |
+| **Куда** | `HF_HOME` = `/workspace/cache/huggingface` |
+| **VRAM** | **не занимает** — то же, что ручная кнопка «Скачать» на вкладке «Модели» |
+| **VRAM позже** | только при синтезе или «Загрузить в GPU» |
+| **Отключить** | env `QWEN_PROVISION_MODELS=0` |
+| **LOG** | строки `[provision] Downloading: ...` / `Skip (cached)` |
+| **UI** | вкладка «Модели» — баннер прогресса, список обновляется каждые 15 с |
+
+Первый rent с пустым диском: скачивание **долгое** (минуты); UI на :8000 уже доступен. Повторный инстанс с тем же volume — быстрее (кэш на диске).
+
+### UI: бэкап и скачивание
+
+| Вкладка | Функция |
+|---|---|
+| **💾 Бэкап голосов** | ZIP всех `custom_voices` + `designed_voices`; импорт на другой инстанс |
+| **Результат 1…5** | `show_download_button=True` — скачать сгенерированный WAV |
+| Перенос без UI | `scp` папки `/workspace/custom_voices/` (см. README) |
+
+Локальная копия для разработки: `qwen3-voices/` в gitignore, не коммитить.
 
 ## Шаблон Vast.ai
 
@@ -107,9 +135,12 @@ cu121 на 50xx: синтез падает `no kernel image is available`.
 
 ## Workflow
 
-1. Правки → `git push` → GHA → GHCR.  
-2. **Новый инстанс** с `:latest`.  
-3. Проверка: HTTP 8000, синтез фразы, нет Traceback в LOG.
+1. Правки → коммит в **`main`** (по просьбе пользователя) → пользователь сам **`git push origin main`**.  
+2. GHA собирает образ только с **push в `main`**.  
+3. **Новый инстанс** с `:latest` (не патчить running).  
+4. Проверка: HTTP 8000, вкладка «Модели» (предзагрузка), синтез, нет Traceback в LOG.
+
+**Git для AI:** не предлагать PR / ветки `cursor/*`, если пользователь не просил. Схема: сделал фичу → закоммитил в `main` → пользователь пушит. Push и merge делает пользователь.
 
 ## Сбои (LOG)
 
@@ -118,9 +149,11 @@ cu121 на 50xx: синтез падает `no kernel image is available`.
 | Exited, `unexpected keyword argument 'theme'` | Gradio 5 — theme в Blocks |
 | Connecting… | процесс упал или Portal; прямой :8000 |
 | `no kernel image` | cu121 на 50xx |
+| `CUDA out of memory` | несколько моделей в GPU; 1.7B + Whisper; выгрузить на «Модели», взять 0.6B |
 | CI `Cannot uninstall pip` | не апгрейдить pip в Dockerfile |
 | `sed: unknown option` | portal + `\|` в PORTAL_CONFIG |
 | Нет кнопки Open | нет `OPEN_BUTTON_PORT` в шаблоне |
+| Модели «Не загружено» сразу после rent | идёт `[provision]` — подождать / F5 на «Модели» |
 
 ## Anti-patterns
 
@@ -144,13 +177,16 @@ cu121 на 50xx: синтез падает `no kernel image is available`.
 - [x] Шаблон Vast: ENTRYPOINT, порты 8000/1111/22, `OPEN_BUTTON_PORT`
 - [x] AGENTS.md — актуальный handoff
 - [x] Тест на Vast: **RTX 5060 Ti**, UI в браузере (после фикса Exited)
+- [x] Бэкап голосов: экспорт/импорт ZIP (`💾 Бэкап голосов`)
+- [x] Скачивание сгенерированного WAV (`show_download_button` на «Результат»)
+- [x] Auto-download моделей на **диск** при старте (`QWEN_PROVISION_MODELS=1`, `start_model_provisioning`)
 
 ### Планы
 
 - [ ] Подтвердить на **RTX 4090** (Ada) и **5090** (отдельные инстансы)
 - [ ] Отдельный тег образа `:cu121` для дешёвых 30xx/40xx (опционально)
 - [ ] OpenAI-compatible API (`/v1/audio/speech`) — свой слой или образ malaiwah
-- [x] Auto-download моделей при старте (`QWEN_PROVISION_MODELS=1`, фоновый поток в `app.py`)
+- [ ] Автовыгрузка предыдущей модели из VRAM при смене типа (меньше OOM на 16 GB)
 - [ ] Публичный шаблон Vast в каталоге (сейчас private — ок)
 - [ ] Сжатие/квантование моделей для 8 GB GPU (0.6B по умолчанию в UI)
 
@@ -164,6 +200,6 @@ cu121 на 50xx: синтез падает `no kernel image is available`.
 
 > Прочитай `README.md` и `AGENTS.md`. **Qwen3-TTS-Vast**, образ `ghcr.io/akai2211/qwen3-tts-vast:latest`, ENTRYPOINT, :8000, cu128, после правок — новый инстанс. По-русски.
 
-**AI:** TTS, не Forge; команды для копипасты; не коммитить/push без просьбы; Open Ports — ссылки первым блоком.
+**AI:** TTS, не Forge; по-русски; команды для копипасты; коммит — по просьбе, **push только пользователь**; не путать предзагрузку на диск с «Загрузить в GPU»; не навязывать PR/`cursor/*` ветки; Open Ports — ссылки первым блоком.
 
 *Июнь 2026.*

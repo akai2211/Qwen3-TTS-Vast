@@ -871,63 +871,235 @@ def _normalize_audio(wav, eps=1e-12, clip=True):
 
 import re
 
-def chunk_text(text: str, max_chars: int = 200) -> list:
-    """
-    Split text into chunks without cutting words.
-    Tries to split on sentence boundaries first, then falls back to word boundaries.
-    """
-    text = text.strip()
-    if not text:
+# Конец предложения: точка/вопрос/воскл./многоточие (не режем слово посередине)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…。！？])\s+")
+# Абзац в .txt — отдельный кусок (естественная пауза в книге)
+_PARAGRAPH_SPLIT = re.compile(r"\n\s*\n+")
+
+
+def _chunk_paragraph(paragraph: str, max_chars: int) -> list[str]:
+    """Один абзац → куски: сначала целые предложения, длинное — по словам (не по символам)."""
+    paragraph = paragraph.strip()
+    if not paragraph:
         return []
-    
-    if len(text) <= max_chars:
-        return [text]
-    
-    # Sentence-ending punctuation patterns
-    sentence_endings = re.compile(r'(?<=[.!?。！？])\s+')
-    
-    # Split into sentences first
-    sentences = sentence_endings.split(text)
-    
-    chunks = []
+    if len(paragraph) <= max_chars:
+        return [paragraph]
+
+    sentences = [s.strip() for s in _SENTENCE_SPLIT.split(paragraph) if s.strip()]
+    if not sentences:
+        sentences = [paragraph]
+
+    chunks: list[str] = []
     current_chunk = ""
-    
+
     for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-            
-        # If single sentence is too long, split by words
         if len(sentence) > max_chars:
-            # Flush current chunk first
             if current_chunk:
                 chunks.append(current_chunk.strip())
                 current_chunk = ""
-            
-            # Split long sentence by words
+
             words = sentence.split()
             for word in words:
-                if len(current_chunk) + len(word) + 1 <= max_chars:
-                    current_chunk = current_chunk + " " + word if current_chunk else word
+                if len(word) > max_chars:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = ""
+                    chunks.append(word)
+                    continue
+                sep = " " if current_chunk else ""
+                if len(current_chunk) + len(sep) + len(word) <= max_chars:
+                    current_chunk = current_chunk + sep + word
                 else:
                     if current_chunk:
                         chunks.append(current_chunk.strip())
                     current_chunk = word
         else:
-            # Try to add sentence to current chunk
-            test_chunk = current_chunk + " " + sentence if current_chunk else sentence
+            test_chunk = f"{current_chunk} {sentence}".strip() if current_chunk else sentence
             if len(test_chunk) <= max_chars:
                 current_chunk = test_chunk
             else:
                 if current_chunk:
                     chunks.append(current_chunk.strip())
                 current_chunk = sentence
-    
-    # Don't forget the last chunk
+
     if current_chunk:
         chunks.append(current_chunk.strip())
-    
     return chunks
+
+
+def chunk_text(text: str, max_chars: int = 200) -> list:
+    """
+    Разбивка для озвучки книги:
+    1) пустая строка между абзацами → новый кусок;
+    2) внутри абзаца — по концам предложений (. ! ? …);
+    3) если одно предложение длиннее лимита — по пробелам между **словами**;
+    4) посередине слова **не** режем (кроме редкого слова длиннее лимита целиком).
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    paragraphs = [p.strip() for p in _PARAGRAPH_SPLIT.split(text) if p.strip()]
+    if not paragraphs:
+        paragraphs = [text]
+
+    chunks: list[str] = []
+    for para in paragraphs:
+        chunks.extend(_chunk_paragraph(para, max_chars))
+
+    return chunks if chunks else [text]
+
+
+# Audiobook / batch .txt input
+TEXT_SOURCE_PASTE = "Вставить текст"
+TEXT_SOURCE_SINGLE = "Файл .txt"
+TEXT_SOURCE_MULTI = "До 5 файлов .txt"
+BOOK_TXT_MAX_FILES = 5
+BOOK_TXT_MAX_BYTES = 10 * 1024 * 1024
+# Ориентир для подсказок: ~12–14 симв./с речи (рус.), зависит от темпа
+BOOK_CHARS_PER_SECOND_EST = 13
+
+
+def _decode_txt_bytes(raw: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "cp1251", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _normalize_uploaded_paths(upload) -> list[Path]:
+    if upload is None:
+        return []
+    if isinstance(upload, str):
+        return [Path(upload)]
+    if isinstance(upload, dict) and upload.get("path"):
+        return [Path(upload["path"])]
+    paths: list[Path] = []
+    for item in upload:
+        if isinstance(item, str):
+            paths.append(Path(item))
+        elif isinstance(item, dict) and item.get("path"):
+            paths.append(Path(item["path"]))
+    return paths
+
+
+def _read_txt_file(path: Path) -> str:
+    if not path.is_file():
+        raise FileNotFoundError(f"Файл не найден: {path.name}")
+    if path.suffix.lower() != ".txt":
+        raise ValueError(f"Нужен .txt, получено: {path.name}")
+    size = path.stat().st_size
+    if size > BOOK_TXT_MAX_BYTES:
+        raise ValueError(
+            f"{path.name}: слишком большой ({size // (1024 * 1024)} МБ, макс. "
+            f"{BOOK_TXT_MAX_BYTES // (1024 * 1024)} МБ)"
+        )
+    return _decode_txt_bytes(path.read_bytes()).strip()
+
+
+def resolve_text_jobs(text_mode: str, pasted_text: str, uploaded_files) -> tuple[list[tuple[str, str]], str | None]:
+    """
+    Resolve narration text from paste or .txt upload(s).
+    Returns ([(label, text), ...], error_message).
+    """
+    mode = (text_mode or TEXT_SOURCE_PASTE).strip()
+
+    if mode == TEXT_SOURCE_PASTE:
+        text = (pasted_text or "").strip()
+        if not text:
+            return [], "Ошибка: введите текст или выберите загрузку .txt."
+        return [("Текст", text)], None
+
+    paths = _normalize_uploaded_paths(uploaded_files)
+    if not paths:
+        return [], "Ошибка: загрузите один или несколько файлов .txt."
+
+    if mode == TEXT_SOURCE_SINGLE:
+        if len(paths) > 1:
+            paths = paths[:1]
+        max_files = 1
+    else:
+        max_files = BOOK_TXT_MAX_FILES
+        if len(paths) > max_files:
+            paths = paths[:max_files]
+
+    jobs: list[tuple[str, str]] = []
+    try:
+        for path in paths:
+            text = _read_txt_file(path)
+            if not text:
+                return [], f"Ошибка: файл пустой — {path.name}"
+            jobs.append((path.name, text))
+    except (OSError, ValueError) as e:
+        return [], f"Ошибка чтения .txt: {e}"
+
+    if not jobs:
+        return [], "Ошибка: не удалось прочитать .txt."
+    return jobs, None
+
+
+def estimate_narration_stats(text: str, max_chunk_chars: int) -> dict:
+    """Rough stats for UI / status (not a hard limit)."""
+    text = (text or "").strip()
+    if not text:
+        return {"chars": 0, "chunks": 0, "minutes_est": 0.0}
+    chunks = chunk_text(text, max_chars=max(50, int(max_chunk_chars)))
+    chars = len(text)
+    seconds = chars / BOOK_CHARS_PER_SECOND_EST
+    return {
+        "chars": chars,
+        "chunks": len(chunks),
+        "minutes_est": round(seconds / 60, 1),
+    }
+
+
+def format_jobs_preview(jobs: list[tuple[str, str]], max_chunk_chars: int) -> str:
+    lines = []
+    for label, text in jobs:
+        st = estimate_narration_stats(text, max_chunk_chars)
+        lines.append(
+            f"- **{label}**: {st['chars']} симв. → ~{st['chunks']} частей, "
+            f"~{st['minutes_est']} мин речи"
+        )
+    return "\n".join(lines)
+
+
+def toggle_text_source_ui(text_mode: str):
+    """Show textbox or file upload depending on source mode."""
+    if text_mode == TEXT_SOURCE_PASTE:
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False, value=None),
+        )
+    label = (
+        "Файл .txt для озвучки"
+        if text_mode == TEXT_SOURCE_SINGLE
+        else f"До {BOOK_TXT_MAX_FILES} файлов .txt (очередь → Результат 1, 2, …)"
+    )
+    return (
+        gr.update(visible=False),
+        gr.update(visible=True, label=label),
+    )
+
+
+def _empty_generation_outputs(message: str):
+    return [gr.update(visible=False, value=None)] * 5 + [message]
+
+
+def _pack_generation_outputs(audio_pairs: list, status: str):
+    """audio_pairs: list of (sr, wav) or None, up to 5 slots."""
+    updates = []
+    for i in range(5):
+        if i < len(audio_pairs) and audio_pairs[i] is not None:
+            sr, wav = audio_pairs[i]
+            updates.append(gr.update(visible=True, value=(int(sr), wav)))
+        else:
+            updates.append(gr.update(visible=False, value=None))
+    return updates + [status]
 
 
 def _audio_to_tuple(audio):
@@ -1117,7 +1289,12 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
         # Pad results
         audio_outputs = results + [None] * (5 - len(results))
         
-        total_info = f"Сгенерировано {len(results)} вар., {len(chunks)} частей | Seeds: {all_seeds}"
+        st = estimate_narration_stats(target_text, max_chunk_chars)
+        duration_s = sum(len(r[1]) / r[0] for r in results)
+        total_info = (
+            f"Сгенерировано {len(results)} вар., {len(chunks)} частей (~{st['minutes_est']} мин текста) | "
+            f"Аудио ~{duration_s/60:.1f} мин | Seeds: {all_seeds}"
+        )
         print(f"\n{'='*50}")
         print(f"✅ Готово! {total_info}")
         print(f"{'='*50}\n")
@@ -1128,8 +1305,18 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
         return [None] * 5 + [f"Ошибка: {type(e).__name__}: {e}"]
 
 
-def generate_custom_voice(text, language, speaker, instruct, model_size, seed, num_variants=1):
-    """Generate speech using CustomVoice model."""
+def generate_custom_voice(
+    text,
+    language,
+    speaker,
+    instruct,
+    model_size,
+    seed,
+    num_variants=1,
+    max_chunk_chars=200,
+    chunk_gap=0.0,
+):
+    """Generate speech using CustomVoice model (with chunking for long text)."""
     if not text or not text.strip():
         return [None] * 5 + ["Ошибка: Текст обязателен."]
     if not speaker:
@@ -1138,52 +1325,270 @@ def generate_custom_voice(text, language, speaker, instruct, model_size, seed, n
     results = []
     seeds = []
     try:
+        from tqdm import tqdm
+
         num_variants = int(num_variants)
         base_seed = int(seed)
-        
+        chunks = chunk_text(text.strip(), max_chars=int(max_chunk_chars))
+
         tts = get_model("CustomVoice", model_size)
-        
+
         print(f"\n{'='*50}")
         print(f"🗣️ Custom Voice Generation ({model_size}, {num_variants} variants)")
         print(f"{'='*50}")
         print(f"👤 Диктор: {speaker}")
-        
+        print(f"📝 Text length: {len(text)} chars → {len(chunks)} chunk(s)")
+
+        speaker_id = speaker.lower().replace(" ", "_")
+        instruct_val = instruct.strip() if instruct else None
+
         for i in range(min(num_variants, 5)):
             current_seed = base_seed
             if current_seed == -1:
                 current_seed = random.randint(0, 2147483647)
             else:
                 current_seed = base_seed + i
-            
+
             seeds.append(current_seed)
-            set_seed(current_seed)
-            
             print(f"🎲 Variant {i+1}/{num_variants} [Seed: {current_seed}]")
-            
-            wavs, sr = tts.generate_custom_voice(
-                text=text.strip(),
-                language=language,
-                speaker=speaker.lower().replace(" ", "_"),
-                instruct=instruct.strip() if instruct else None,
-                non_streaming_mode=True,
-                max_new_tokens=2048,
-            )
-            results.append((sr, wavs[0]))
-            
-        # Pad results
+
+            variant_wavs = []
+            sr = None
+            for chunk in tqdm(chunks, desc=f"Variant {i+1} Chunks", unit="chunk"):
+                set_seed(current_seed)
+                wavs, sr = tts.generate_custom_voice(
+                    text=chunk,
+                    language=language,
+                    speaker=speaker_id,
+                    instruct=instruct_val,
+                    non_streaming_mode=True,
+                    max_new_tokens=2048,
+                )
+                variant_wavs.append(wavs[0])
+
+            if len(variant_wavs) > 1 and chunk_gap > 0:
+                gap_samples = int(sr * chunk_gap)
+                silence = np.zeros(gap_samples, dtype=np.float32)
+                parts = []
+                for j, wav in enumerate(variant_wavs):
+                    parts.append(wav)
+                    if j < len(variant_wavs) - 1:
+                        parts.append(silence)
+                final_wav = np.concatenate(parts)
+            else:
+                final_wav = (
+                    np.concatenate(variant_wavs) if len(variant_wavs) > 1 else variant_wavs[0]
+                )
+
+            results.append((sr, final_wav))
+
         audio_outputs = results + [None] * (5 - len(results))
-        
+
         duration_info = ", ".join([f"{len(r[1])/r[0]:.1f}s" for r in results])
-        status = f"Сгенерировано {len(results)} вар. | Seeds: {seeds} | Длит: {duration_info}"
-        
+        status = (
+            f"Сгенерировано {len(results)} вар., {len(chunks)} частей | "
+            f"Seeds: {seeds} | Длит: {duration_info}"
+        )
+
         print(f"\n{'='*50}")
         print(f"✅ Готово! Сгенерировано {len(results)} вариантов.")
         print(f"{'='*50}\n")
-        
+
         return audio_outputs + [status]
     except Exception as e:
         print(f"❌ Ошибка: {type(e).__name__}: {e}")
         return [None] * 5 + [f"Ошибка: {type(e).__name__}: {e}"]
+
+
+def generate_custom_voice_from_sources(
+    text_mode,
+    pasted_text,
+    txt_files,
+    language,
+    speaker,
+    instruct,
+    model_size,
+    seed,
+    num_variants,
+    max_chunk_chars,
+    chunk_gap,
+):
+    jobs, err = resolve_text_jobs(text_mode, pasted_text, txt_files)
+    if err:
+        return _empty_generation_outputs(err)
+    if len(jobs) > 1:
+        return _generate_custom_voice_queue(
+            jobs, language, speaker, instruct, model_size, seed, max_chunk_chars, chunk_gap
+        )
+    _, text = jobs[0]
+    raw = generate_custom_voice(
+        text,
+        language,
+        speaker,
+        instruct,
+        model_size,
+        seed,
+        num_variants,
+        max_chunk_chars,
+        chunk_gap,
+    )
+    audios = raw[:5]
+    status = raw[5]
+    pairs = [a if a is not None else None for a in audios]
+    return _pack_generation_outputs(pairs, status)
+
+
+def _generate_custom_voice_queue(jobs, language, speaker, instruct, model_size, seed, max_chunk_chars, chunk_gap):
+    if len(jobs) > 5:
+        return _empty_generation_outputs("Ошибка: максимум 5 файлов за раз (слотов «Результат»).")
+    pairs: list = []
+    status_lines = []
+    for label, text in jobs:
+        print(f"\n📖 Очередь: {label} ({len(text)} симв.)")
+        raw = generate_custom_voice(
+            text,
+            language,
+            speaker,
+            instruct,
+            model_size,
+            seed,
+            num_variants=1,
+            max_chunk_chars=max_chunk_chars,
+            chunk_gap=chunk_gap,
+        )
+        pairs.append(raw[0])
+        status_lines.append(f"**{label}**: {raw[5]}")
+    preview = format_jobs_preview(jobs, max_chunk_chars)
+    status = (
+        f"📚 Озвучено файлов: {len(jobs)} (каждый — один WAV, главы **не** склеиваются между собой)\n\n"
+        + preview
+        + "\n\n"
+        + "\n".join(status_lines)
+    )
+    return _pack_generation_outputs(pairs, status)
+
+
+def generate_voice_clone_from_sources(
+    ref_audio,
+    ref_text,
+    text_mode,
+    pasted_text,
+    txt_files,
+    language,
+    use_xvector_only,
+    model_size,
+    max_chunk_chars,
+    chunk_gap,
+    seed,
+    num_variants,
+):
+    jobs, err = resolve_text_jobs(text_mode, pasted_text, txt_files)
+    if err:
+        return _empty_generation_outputs(err)
+    if len(jobs) > 1:
+        return _generate_voice_clone_queue(
+            ref_audio,
+            ref_text,
+            jobs,
+            language,
+            use_xvector_only,
+            model_size,
+            max_chunk_chars,
+            chunk_gap,
+            seed,
+        )
+    _, text = jobs[0]
+    raw = generate_voice_clone(
+        ref_audio,
+        ref_text,
+        text,
+        language,
+        use_xvector_only,
+        model_size,
+        max_chunk_chars,
+        chunk_gap,
+        seed,
+        num_variants,
+    )
+    pairs = [a if a is not None else None for a in raw[:5]]
+    return _pack_generation_outputs(pairs, raw[5])
+
+
+def _generate_voice_clone_queue(
+    ref_audio,
+    ref_text,
+    jobs,
+    language,
+    use_xvector_only,
+    model_size,
+    max_chunk_chars,
+    chunk_gap,
+    seed,
+):
+    if len(jobs) > 5:
+        return _empty_generation_outputs("Ошибка: максимум 5 файлов за раз (слотов «Результат»).")
+    pairs: list = []
+    status_lines = []
+    for label, text in jobs:
+        print(f"\n📖 Очередь: {label} ({len(text)} симв.)")
+        raw = generate_voice_clone(
+            ref_audio,
+            ref_text,
+            text,
+            language,
+            use_xvector_only,
+            model_size,
+            max_chunk_chars,
+            chunk_gap,
+            seed,
+            num_variants=1,
+        )
+        pairs.append(raw[0])
+        status_lines.append(f"**{label}**: {raw[5]}")
+    preview = format_jobs_preview(jobs, max_chunk_chars)
+    status = (
+        f"📚 Озвучено файлов: {len(jobs)} (каждый — один WAV)\n\n"
+        + preview
+        + "\n\n"
+        + "\n".join(status_lines)
+    )
+    return _pack_generation_outputs(pairs, status)
+
+
+def generate_voice_design_from_sources(
+    text_mode,
+    pasted_text,
+    txt_files,
+    language,
+    voice_description,
+    seed,
+    num_variants,
+):
+    jobs, err = resolve_text_jobs(text_mode, pasted_text, txt_files)
+    if err:
+        return _empty_generation_outputs(err)
+    if len(jobs) > 1:
+        return _generate_voice_design_queue(jobs, language, voice_description, seed)
+    _, text = jobs[0]
+    raw = generate_voice_design(text, language, voice_description, seed, num_variants)
+    pairs = [a if a is not None else None for a in raw[:5]]
+    return _pack_generation_outputs(pairs, raw[5])
+
+
+def _generate_voice_design_queue(jobs, language, voice_description, seed):
+    if len(jobs) > 5:
+        return _empty_generation_outputs("Ошибка: максимум 5 файлов за раз (слотов «Результат»).")
+    pairs: list = []
+    status_lines = []
+    for label, text in jobs:
+        if len(text) > 800:
+            print(f"⚠️ {label}: {len(text)} симв. — Voice Design лучше для коротких фрагментов.")
+        print(f"\n📖 Очередь: {label} ({len(text)} симв.)")
+        raw = generate_voice_design(text, language, voice_description, seed, num_variants=1)
+        pairs.append(raw[0])
+        status_lines.append(f"**{label}**: {raw[5]}")
+    status = "📚 Озвучено файлов: {}\n\n".format(len(jobs)) + "\n".join(status_lines)
+    return _pack_generation_outputs(pairs, status)
 
 
 def make_result_audio(label: str, visible: bool = False) -> gr.Audio:
@@ -1468,7 +1873,11 @@ def build_ui():
 
             # Tab 1: Voice Design
             with gr.Tab("🎨 Дизайн голоса"):
-                gr.Markdown("*ℹ️ Дизайн голоса создает уникальные голоса на основе описаний. Макс. ~2048 токенов (рекомендуется ~300-500 симв.). Без разбивки на части — для длинных текстов используйте Клонирование или Свои голоса.*")
+                gr.Markdown(
+                    "*ℹ️ Дизайн голоса — короткие фрагменты (~300–800 симв.). "
+                    "Источник текста: вставка или **.txt** (до 5 файлов → Результат 1…5). "
+                    "Для аудиокниг — вкладка **Клонирование**.*"
+                )
                 with gr.Row(equal_height=True):
                     with gr.Column(scale=1):
                         with gr.Accordion("💾 Сохраненные дизайны", open=False):
@@ -1490,11 +1899,22 @@ def build_ui():
                                 delete_design_btn = gr.Button("🗑️ Удалить выбранный", variant="stop")
                             design_save_status = gr.Textbox(label="Статус сохранения", lines=1, interactive=False)
 
+                        design_text_mode = gr.Radio(
+                            label="Источник текста",
+                            choices=[TEXT_SOURCE_PASTE, TEXT_SOURCE_SINGLE, TEXT_SOURCE_MULTI],
+                            value=TEXT_SOURCE_PASTE,
+                        )
                         design_text = gr.Textbox(
                             label="Текст для синтеза",
                             lines=6,
                             placeholder="Введите текст, который хотите озвучить (до ~500 симв.)...",
                             value="Это в верхнем ящике... подожди, там пусто? Быть не может! Я точно помню, что положил это туда!"
+                        )
+                        design_txt_files = gr.File(
+                            label="Файл(ы) .txt",
+                            file_count="multiple",
+                            file_types=[".txt"],
+                            visible=False,
                         )
                         design_instruct = gr.Textbox(
                             label="Описание голоса",
@@ -1536,6 +1956,12 @@ def build_ui():
                     num = int(num)
                     return [gr.update(visible=True) if i < num else gr.update(visible=False, value=None) for i in range(5)]
 
+                design_text_mode.change(
+                    toggle_text_source_ui,
+                    inputs=[design_text_mode],
+                    outputs=[design_text, design_txt_files],
+                )
+
                 design_num_variants.change(
                     update_audio_visibility,
                     inputs=[design_num_variants],
@@ -1543,8 +1969,16 @@ def build_ui():
                 )
 
                 design_btn.click(
-                    generate_voice_design,
-                    inputs=[design_text, design_language, design_instruct, design_seed, design_num_variants],
+                    generate_voice_design_from_sources,
+                    inputs=[
+                        design_text_mode,
+                        design_text,
+                        design_txt_files,
+                        design_language,
+                        design_instruct,
+                        design_seed,
+                        design_num_variants,
+                    ],
                     outputs=design_audio_outputs + [design_status],
                 )
 
@@ -1575,6 +2009,28 @@ def build_ui():
 
             # Tab 2: Voice Clone
             with gr.Tab("🎭 Клонирование голоса"):
+                gr.Markdown(
+                    """
+**Аудиокниги (как это устроено)**
+
+| Что загружаете | Что получаете |
+|---|---|
+| **1 файл .txt** (одна глава) | **Один** WAV в «Результат 1»: текст режется на **части** → озвучивается → **склеивается только внутри этой главы** |
+| **До 5 файлов .txt** | **Пять** отдельных WAV: «Результат 1» = глава 1, «Результат 2» = глава 2… **Главы между собой не склеиваются** |
+
+**Лимиты (не путать):**
+- **Нет** лимита «2300 символов на главу» — глава может быть на десятки тысяч символов.
+- **«Размер части»** (по умолчанию 200) — только размер **куска для одного прохода модели**; длинная глава = много кусков, потом один WAV.
+- Файл .txt до **10 МБ**; за раз до **5** файлов (5 слотов «Результат»).
+- **~20 минут речи на главу** — нормально, но считайте **время GPU**: ~1–3 мин озвучки на 1 мин аудио (зависит от GPU и размера части). Глава 20 мин → часто **20–60+ мин** работы.
+
+**Разбивка текста:** не по символам — сначала **абзацы** (пустая строка в .txt), потом **предложения**, потом **слова**. Слово посередине не режется.
+
+**Стыки между кусками:** каждый кусок — отдельный вызов нейросети, на стыке интонация может «сбрасываться». Меньше стыков → больше «Размер части» (300–400). Лёгкая **пауза между частями** (0.1–0.25 с) иногда сглаживает склейку.
+
+Для длинных глав: **«Размер части»** 300–400; если модель обрывает фразу — уменьшите до 200–250.
+                    """
+                )
                 with gr.Row(equal_height=True):
                     with gr.Column(scale=1):
                         with gr.Accordion("💾 Сохраненные голоса", open=True):
@@ -1612,10 +2068,21 @@ def build_ui():
                             label="Только x-vector (текст не нужен, качество ниже)",
                             value=False,
                         )
+                        clone_text_mode = gr.Radio(
+                            label="Источник текста",
+                            choices=[TEXT_SOURCE_PASTE, TEXT_SOURCE_SINGLE, TEXT_SOURCE_MULTI],
+                            value=TEXT_SOURCE_PASTE,
+                        )
                         clone_target_text = gr.Textbox(
                             label="Целевой текст",
                             lines=5,
                             placeholder="Текст для озвучки клонированным голосом...",
+                        )
+                        clone_txt_files = gr.File(
+                            label="Файл(ы) .txt",
+                            file_count="multiple",
+                            file_types=[".txt"],
+                            visible=False,
                         )
                         with gr.Row():
                             clone_language = gr.Dropdown(
@@ -1632,10 +2099,10 @@ def build_ui():
                             )
                         with gr.Row():
                             clone_chunk_size = gr.Slider(
-                                label="Размер части (симв.)",
+                                label="Размер части (симв.) — не лимит главы, только кусок за раз",
                                 minimum=50,
                                 maximum=500,
-                                value=200,
+                                value=300,
                                 step=10,
                             )
                             clone_chunk_gap = gr.Slider(
@@ -1668,6 +2135,12 @@ def build_ui():
                             )
                         clone_status = gr.Textbox(label="Статус", lines=2, interactive=False)
 
+                clone_text_mode.change(
+                    toggle_text_source_ui,
+                    inputs=[clone_text_mode],
+                    outputs=[clone_target_text, clone_txt_files],
+                )
+
                 clone_num_variants.change(
                     update_audio_visibility,
                     inputs=[clone_num_variants],
@@ -1681,8 +2154,21 @@ def build_ui():
                 )
                 
                 clone_btn.click(
-                    generate_voice_clone,
-                    inputs=[clone_ref_audio, clone_ref_text, clone_target_text, clone_language, clone_xvector, clone_model_size, clone_chunk_size, clone_chunk_gap, clone_seed, clone_num_variants],
+                    generate_voice_clone_from_sources,
+                    inputs=[
+                        clone_ref_audio,
+                        clone_ref_text,
+                        clone_text_mode,
+                        clone_target_text,
+                        clone_txt_files,
+                        clone_language,
+                        clone_xvector,
+                        clone_model_size,
+                        clone_chunk_size,
+                        clone_chunk_gap,
+                        clone_seed,
+                        clone_num_variants,
+                    ],
                     outputs=clone_audio_outputs + [clone_status],
                 )
 
@@ -1713,14 +2199,28 @@ def build_ui():
 
             # Tab 3: Custom Voice TTS
             with gr.Tab("🗣️ Свои голоса"):
-                gr.Markdown("*ℹ️ Эта вкладка использует предустановленных дикторов. Макс. ~2048 токенов (рекомендуется ~300-500 симв.). Для более длинных текстов используйте Клонирование.*")
+                gr.Markdown(
+                    "*ℹ️ Предустановленные дикторы. До **5** .txt → отдельный WAV на файл; внутри файла длинный текст режется и склеивается в один трек. "
+                    "Свой голос книги — вкладка **Клонирование**.*"
+                )
                 with gr.Row(equal_height=True):
                     with gr.Column(scale=1):
+                        tts_text_mode = gr.Radio(
+                            label="Источник текста",
+                            choices=[TEXT_SOURCE_PASTE, TEXT_SOURCE_SINGLE, TEXT_SOURCE_MULTI],
+                            value=TEXT_SOURCE_PASTE,
+                        )
                         tts_text = gr.Textbox(
                             label="Текст для синтеза",
                             lines=6,
-                            placeholder="Введите текст, который хотите озвучить (до ~500 симв.)...",
+                            placeholder="Введите текст, который хотите озвучить...",
                             value="Привет! Добро пожаловать в систему синтеза речи. Это демонстрация наших возможностей TTS."
+                        )
+                        tts_txt_files = gr.File(
+                            label="Файл(ы) .txt",
+                            file_count="multiple",
+                            file_types=[".txt"],
+                            visible=False,
                         )
                         with gr.Row():
                             tts_speaker = gr.Dropdown(
@@ -1760,6 +2260,21 @@ def build_ui():
                                 value=1,
                                 step=1,
                             )
+                        with gr.Row():
+                            tts_chunk_size = gr.Slider(
+                                label="Размер части (симв.) — не лимит главы",
+                                minimum=50,
+                                maximum=500,
+                                value=300,
+                                step=10,
+                            )
+                            tts_chunk_gap = gr.Slider(
+                                label="Пауза между частями (с)",
+                                minimum=0.0,
+                                maximum=3.0,
+                                value=0.0,
+                                step=0.01,
+                            )
                         tts_btn = gr.Button("🎙️ Генерировать", variant="primary", size="lg")
 
                     with gr.Column(scale=1):
@@ -1770,6 +2285,12 @@ def build_ui():
                             )
                         tts_status = gr.Textbox(label="Статус", lines=2, interactive=False)
 
+                tts_text_mode.change(
+                    toggle_text_source_ui,
+                    inputs=[tts_text_mode],
+                    outputs=[tts_text, tts_txt_files],
+                )
+
                 tts_num_variants.change(
                     update_audio_visibility,
                     inputs=[tts_num_variants],
@@ -1777,8 +2298,20 @@ def build_ui():
                 )
 
                 tts_btn.click(
-                    generate_custom_voice,
-                    inputs=[tts_text, tts_language, tts_speaker, tts_instruct, tts_model_size, tts_seed, tts_num_variants],
+                    generate_custom_voice_from_sources,
+                    inputs=[
+                        tts_text_mode,
+                        tts_text,
+                        tts_txt_files,
+                        tts_language,
+                        tts_speaker,
+                        tts_instruct,
+                        tts_model_size,
+                        tts_seed,
+                        tts_num_variants,
+                        tts_chunk_size,
+                        tts_chunk_gap,
+                    ],
                     outputs=tts_audio_outputs + [tts_status],
                 )
 
