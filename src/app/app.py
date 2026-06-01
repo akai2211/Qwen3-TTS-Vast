@@ -56,6 +56,8 @@ VOICES_ARCHIVE_FORMAT_VERSION = 1
 VOICES_ARCHIVE_MAX_BYTES = 200 * 1024 * 1024
 EXPORTS_DIR = WORKSPACE / "exports"
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUTS_DIR = WORKSPACE / "outputs"
+OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _read_voices_json(path: Path) -> dict:
@@ -1061,6 +1063,17 @@ def generate_custom_voice(text, language, speaker, instruct, model_size, seed, n
         return [None] * 5 + [f"Ошибка: {type(e).__name__}: {e}"]
 
 
+def make_result_audio(label: str, visible: bool = False) -> gr.Audio:
+    """Output-only audio player with a visible download control."""
+    return gr.Audio(
+        label=label,
+        type="numpy",
+        interactive=False,
+        show_download_button=True,
+        visible=visible,
+    )
+
+
 # Build Gradio UI
 def build_ui():
     theme = gr.themes.Soft(
@@ -1380,7 +1393,9 @@ def build_ui():
                     with gr.Column(scale=1):
                         design_audio_outputs = []
                         for i in range(5):
-                            design_audio_outputs.append(gr.Audio(label=f"Результат {i+1}", type="numpy", visible=(i==0)))
+                            design_audio_outputs.append(
+                                make_result_audio(f"Результат {i+1}", visible=(i == 0))
+                            )
                         design_status = gr.Textbox(label="Статус", lines=2, interactive=False)
 
                 def update_audio_visibility(num):
@@ -1514,7 +1529,9 @@ def build_ui():
                     with gr.Column(scale=1):
                         clone_audio_outputs = []
                         for i in range(5):
-                            clone_audio_outputs.append(gr.Audio(label=f"Результат {i+1}", type="numpy", visible=(i==0)))
+                            clone_audio_outputs.append(
+                                make_result_audio(f"Результат {i+1}", visible=(i == 0))
+                            )
                         clone_status = gr.Textbox(label="Статус", lines=2, interactive=False)
 
                 clone_num_variants.change(
@@ -1614,7 +1631,9 @@ def build_ui():
                     with gr.Column(scale=1):
                         tts_audio_outputs = []
                         for i in range(5):
-                            tts_audio_outputs.append(gr.Audio(label=f"Результат {i+1}", type="numpy", visible=(i==0)))
+                            tts_audio_outputs.append(
+                                make_result_audio(f"Результат {i+1}", visible=(i == 0))
+                            )
                         tts_status = gr.Textbox(label="Статус", lines=2, interactive=False)
 
                 tts_num_variants.change(
@@ -1784,5 +1803,6 @@ if __name__ == "__main__":
             str(VOICES_DIR.absolute()),
             str(DESIGNED_VOICES_DIR.absolute()),
             str(EXPORTS_DIR.absolute()),
+            str(OUTPUTS_DIR.absolute()),
         ],
     )
